@@ -113,7 +113,6 @@ const Hero = () => {
                 alt="Harsh Srivastava"
                 className="relative w-full rounded-lg shadow-2xl card-3d"
                 loading="eager"
-                fetchPriority="high"
               />
             </div>
           </div>

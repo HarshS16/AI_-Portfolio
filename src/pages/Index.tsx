@@ -7,6 +7,7 @@ import Education from "@/components/Education";
 import Projects from "@/components/Projects";
 import Contact from "@/components/Contact";
 import Footer from "@/components/Footer";
+import ChatBot from "@/components/ChatBot";
 import { ParticlesComponent } from "@/components/ui/Particles";
 
 const Index = () => {
@@ -21,6 +22,7 @@ const Index = () => {
       <Education />
       <Projects />
       <Contact />
+      <ChatBot />
       <Footer />
     </div>
   );

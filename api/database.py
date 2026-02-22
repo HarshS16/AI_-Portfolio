@@ -9,10 +9,11 @@ from datetime import datetime, timezone
 from sqlalchemy import Column, String, Text, DateTime, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+from pathlib import Path
 from dotenv import load_dotenv
 import os
 
-load_dotenv()
+load_dotenv(Path(__file__).parent / ".env")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./chat.db")
 

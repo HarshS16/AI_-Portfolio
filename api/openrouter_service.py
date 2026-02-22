@@ -1,28 +1,33 @@
 """
-OpenRouter API service with automatic model fallback.
-Tries multiple free models if one is rate-limited (429) or errors (400).
+OpenRouter API service with parallel model requests.
+Fires requests to ALL free models simultaneously and uses whichever responds first.
 """
 
 import os
 import re
+import asyncio
 import httpx
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).parent / ".env")
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
-# Free models to try, in order of preference
-# NOTE: Avoid models that don't support system instructions (e.g. Gemma)
-# NOTE: Reasoning models (R1) placed last — slower and use <think> tags
+# Free models — all tried in parallel for fastest response
+# More models = higher chance at least one isn't rate-limited
 FREE_MODELS = [
     "meta-llama/llama-3.3-70b-instruct:free",
     "mistralai/mistral-small-3.1-24b-instruct:free",
     "qwen/qwen3-4b:free",
-    "openai/gpt-oss-120b:free",
-    "nousresearch/hermes-3-llama-3.1-405b:free",
+    "qwen/qwen3-next-80b-a3b-instruct:free",
+    "nvidia/nemotron-nano-9b-v2:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
+    "arcee-ai/trinity-large-preview:free",
+    "stepfun/step-3.5-flash:free",
     "deepseek/deepseek-r1-0528:free",
+    "nousresearch/hermes-3-llama-3.1-405b:free",
 ]
 
 
@@ -34,17 +39,61 @@ def clean_response(text: str) -> str:
     return cleaned if cleaned else text.strip()
 
 
+async def _try_model(
+    client: httpx.AsyncClient,
+    model: str,
+    headers: dict,
+    messages: list[dict],
+    max_tokens: int,
+    temperature: float,
+) -> dict | None:
+    """
+    Try a single model. Returns the parsed result dict on success, or None on failure.
+    """
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    try:
+        response = await client.post(
+            OPENROUTER_API_URL,
+            headers=headers,
+            json=payload,
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+            raw_content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+            content = clean_response(raw_content)
+            if content:
+                return {"content": content, "model_used": model}
+
+        # Log non-200 for debugging
+        if response.status_code != 200:
+            print(f"[{response.status_code}] {model}")
+
+    except httpx.TimeoutException:
+        print(f"[TIMEOUT] {model}")
+    except Exception as e:
+        print(f"[ERROR] {model}: {e}")
+
+    return None
+
+
 async def get_chat_response(
     messages: list[dict],
     max_tokens: int = 500,
     temperature: float = 0.7,
 ) -> dict:
     """
-    Send messages to OpenRouter and return the AI response.
-    Automatically falls back to the next model on 429/400/empty responses.
-
-    Returns:
-        dict with 'content' (str) and 'model_used' (str)
+    Fire requests to ALL models in parallel and return the first successful response.
+    This dramatically reduces latency compared to sequential fallback.
     """
     if not OPENROUTER_API_KEY:
         raise ValueError("OPENROUTER_API_KEY is not set in environment variables.")
@@ -56,61 +105,22 @@ async def get_chat_response(
         "X-Title": "Harsh Srivastava Portfolio",
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        last_error = ""
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        # Create a task for each model
+        tasks = [
+            asyncio.create_task(
+                _try_model(client, model, headers, messages, max_tokens, temperature)
+            )
+            for model in FREE_MODELS
+        ]
 
-        for model in FREE_MODELS:
-            payload = {
-                "model": model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            }
+        # As each task completes, check if it succeeded
+        for coro in asyncio.as_completed(tasks):
+            result = await coro
+            if result is not None:
+                # Cancel all remaining tasks to save resources
+                for task in tasks:
+                    task.cancel()
+                return result
 
-            try:
-                response = await client.post(
-                    OPENROUTER_API_URL,
-                    headers=headers,
-                    json=payload,
-                )
-
-                if response.status_code == 200:
-                    data = response.json()
-                    raw_content = (
-                        data.get("choices", [{}])[0]
-                        .get("message", {})
-                        .get("content", "")
-                    )
-                    content = clean_response(raw_content)
-
-                    if content:
-                        return {
-                            "content": content,
-                            "model_used": model,
-                        }
-                    # Empty response — try next model
-                    print(f"[WARN] Model {model} returned empty, trying next...")
-                    continue
-
-                # On rate-limit (429) or bad request (400), try next model
-                if response.status_code in (429, 400):
-                    reason = "rate-limited" if response.status_code == 429 else "error"
-                    print(f"[WARN] Model {model} {reason} ({response.status_code}), trying next...")
-                    continue
-
-                # Other error — log and continue
-                last_error = f"API error {response.status_code}: {response.text}"
-                print(f"[ERROR] OpenRouter error ({model}): {last_error}")
-                continue
-
-            except httpx.TimeoutException:
-                print(f"[TIMEOUT] Model {model} timed out, trying next...")
-                continue
-            except Exception as e:
-                last_error = str(e)
-                print(f"[ERROR] Unexpected error ({model}): {e}")
-                continue
-
-        raise RuntimeError(
-            last_error or "All models are currently rate-limited. Please try again shortly."
-        )
+    raise RuntimeError("All models failed. Please try again shortly.")

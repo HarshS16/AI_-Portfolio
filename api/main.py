@@ -1,10 +1,11 @@
 """
 FastAPI backend for Harsh Srivastava's Portfolio AI Chatbot.
 
-Three-layer defense system:
+Security layers:
   Layer 1: Bulletproof system prompt (resume-only, positive, anti-hallucination)
   Layer 2: Post-response validation (backend catches bad outputs)
   Layer 3: Question classification (pre-filters before hitting LLM)
+  Rate Limiting: Per-IP sliding window to prevent DDoS/abuse
 
 Endpoints:
   POST /api/chat         — Send a message, get AI response
@@ -12,7 +13,7 @@ Endpoints:
   GET  /api/health       — Health check
 """
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -25,6 +26,7 @@ from api.resume_context import (
     validate_response,
     CATEGORY_RESPONSES,
 )
+from api.rate_limiter import check_rate_limit, rate_limiter, get_client_ip
 
 # ── App Setup ──────────────────────────────────────────────────────────────────
 
@@ -57,6 +59,7 @@ def on_startup():
     init_db()
     print("[OK] Database initialized")
     print("[OK] 3-layer defense system active")
+    print("[OK] Rate limiter active")
 
 
 # ── Schemas ────────────────────────────────────────────────────────────────────
@@ -84,10 +87,15 @@ class ChatHistoryItem(BaseModel):
 @app.get("/api/health")
 def health_check():
     """Health check endpoint."""
-    return {"status": "ok", "service": "portfolio-chatbot-api", "version": "2.0.0"}
+    return {
+        "status": "ok",
+        "service": "portfolio-chatbot-api",
+        "version": "2.1.0",
+        "rate_limiter": rate_limiter.get_stats(),
+    }
 
 
-@app.post("/api/chat", response_model=ChatResponse)
+@app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(check_rate_limit("chat"))])
 async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     """
     Main chat endpoint with 3-layer defense:
@@ -222,7 +230,7 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     )
 
 
-@app.get("/api/chat/history", response_model=list[ChatHistoryItem])
+@app.get("/api/chat/history", response_model=list[ChatHistoryItem], dependencies=[Depends(check_rate_limit("history"))])
 def get_chat_history(session_id: str, db: Session = Depends(get_db)):
     """Retrieve chat history for a given session."""
     messages = (

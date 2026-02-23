@@ -58,17 +58,23 @@ Incoming questions are classified **before** they reach the LLM, allowing instan
 
 ### Additional Hardening
 
+- **Rate Limiting** — Per-IP sliding window rate limiter to prevent DDoS and abuse:
+  - `/api/chat`: **10 requests/minute** per IP
+  - `/api/chat/history`: **30 requests/minute** per IP
+  - Global cap: **100 requests/minute** per IP
+  - Returns `429 Too Many Requests` with a `Retry-After` header when exceeded.
 - **Low Temperature (0.3)** — Reduces creativity/randomness, making hallucination less likely.
 - **Token Limit (300)** — Enforces concise responses, matching the format rules.
-- **Console Logging** — Every request logs its classification (`[L3]`) and validation status (`[L2]`) for debugging.
+- **Console Logging** — Every request logs its classification (`[L3]`), validation status (`[L2]`), and rate limit hits.
 
 ## 🛠️ Project Structure
 
 ```text
 ├── api/                      # Python FastAPI Backend (Vercel Serverless)
-│   ├── main.py               # API entry point — routes + 3-layer defense orchestration
+│   ├── main.py               # API entry point — routes + defense orchestration
 │   ├── database.py           # SQLAlchemy & SQLite configuration
 │   ├── openrouter_service.py # Parallel multi-model AI requests
+│   ├── rate_limiter.py       # Per-IP sliding window rate limiter (DDoS protection)
 │   └── resume_context.py     # System prompt, question classifier & response validator
 ├── src/                      # React Frontend
 │   ├── components/           # UI Components (ChatBot, Hero, About, etc.)

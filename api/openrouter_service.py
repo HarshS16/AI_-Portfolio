@@ -88,8 +88,8 @@ async def _try_model(
 
 async def get_chat_response(
     messages: list[dict],
-    max_tokens: int = 500,
-    temperature: float = 0.7,
+    max_tokens: int = 300,
+    temperature: float = 0.3,
 ) -> dict:
     """
     Fire requests to ALL models in parallel and return the first successful response.

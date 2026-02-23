@@ -1,6 +1,11 @@
 """
 FastAPI backend for Harsh Srivastava's Portfolio AI Chatbot.
 
+Three-layer defense system:
+  Layer 1: Bulletproof system prompt (resume-only, positive, anti-hallucination)
+  Layer 2: Post-response validation (backend catches bad outputs)
+  Layer 3: Question classification (pre-filters before hitting LLM)
+
 Endpoints:
   POST /api/chat         — Send a message, get AI response
   GET  /api/chat/history — Retrieve chat history for a session
@@ -14,14 +19,19 @@ from sqlalchemy.orm import Session
 
 from api.database import init_db, get_db, ChatMessage
 from api.openrouter_service import get_chat_response
-from api.resume_context import RESUME_SYSTEM_PROMPT
+from api.resume_context import (
+    RESUME_SYSTEM_PROMPT,
+    classify_question,
+    validate_response,
+    CATEGORY_RESPONSES,
+)
 
 # ── App Setup ──────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Harsh Srivastava Portfolio API",
     description="AI-powered chatbot backend for the portfolio website",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 # CORS — allow frontend dev server and production origins
@@ -46,6 +56,7 @@ def on_startup():
     """Initialize the database on app start."""
     init_db()
     print("[OK] Database initialized")
+    print("[OK] 3-layer defense system active")
 
 
 # ── Schemas ────────────────────────────────────────────────────────────────────
@@ -73,32 +84,68 @@ class ChatHistoryItem(BaseModel):
 @app.get("/api/health")
 def health_check():
     """Health check endpoint."""
-    return {"status": "ok", "service": "portfolio-chatbot-api"}
+    return {"status": "ok", "service": "portfolio-chatbot-api", "version": "2.0.0"}
 
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     """
-    Main chat endpoint.
-    1. Loads recent chat history from DB for the session
-    2. Builds a message list with the resume system prompt
-    3. Calls OpenRouter with fallback models
-    4. Stores both user and assistant messages in DB
-    5. Returns the AI response
+    Main chat endpoint with 3-layer defense:
+
+    Layer 3 (Pre-filter):  Classify the question and short-circuit obvious
+                           jailbreaks, off-topic, and sensitive queries.
+    Layer 1 (System Prompt): The LLM is constrained by a bulletproof system
+                             prompt with strict resume-only + positive rules.
+    Layer 2 (Post-validation): The AI response is validated for negativity,
+                               hallucination, and prompt leakage before returning.
     """
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
-    # Save user message to DB
+    user_message = request.message.strip()
+
+    # ── LAYER 3: Question Classification (pre-filter) ──────────────────────
+    category = classify_question(user_message)
+    print(f"[L3] Category: {category} | Message: {user_message[:80]}...")
+
+    # Short-circuit for JAILBREAK, OFF_TOPIC, PERSONAL_SENSITIVE
+    if category in CATEGORY_RESPONSES:
+        preset_reply = CATEGORY_RESPONSES[category]
+
+        # Save user message to DB
+        user_msg = ChatMessage(
+            session_id=request.session_id,
+            role="user",
+            content=user_message,
+        )
+        db.add(user_msg)
+
+        # Save preset response to DB
+        assistant_msg = ChatMessage(
+            session_id=request.session_id,
+            role="assistant",
+            content=preset_reply,
+            model_used=f"preset:{category.lower()}",
+        )
+        db.add(assistant_msg)
+        db.commit()
+
+        return ChatResponse(
+            reply=preset_reply,
+            model_used=f"preset:{category.lower()}",
+            session_id=request.session_id,
+        )
+
+    # ── Save user message to DB ────────────────────────────────────────────
     user_msg = ChatMessage(
         session_id=request.session_id,
         role="user",
-        content=request.message.strip(),
+        content=user_message,
     )
     db.add(user_msg)
     db.commit()
 
-    # Load recent conversation history for context (last 20 messages)
+    # ── Load recent conversation history for context (last 20 messages) ────
     recent_db_messages = (
         db.query(ChatMessage)
         .filter(ChatMessage.session_id == request.session_id)
@@ -107,16 +154,32 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
         .all()
     )
 
-    # Build the OpenRouter message list
+    # ── LAYER 1: Build messages with bulletproof system prompt ──────────────
     messages = [{"role": "system", "content": RESUME_SYSTEM_PROMPT}]
+
+    # For ATTACK_NEGATIVE questions, inject an extra reinforcement message
+    if category == "ATTACK_NEGATIVE":
+        messages.append({
+            "role": "system",
+            "content": (
+                "[REINFORCEMENT] The user is asking a question that could lead to "
+                "negative statements about Harsh. Remember: ALWAYS reframe positively. "
+                "Highlight Harsh's strengths. NEVER say anything negative."
+            ),
+        })
+
     for msg in recent_db_messages:
         messages.append({"role": msg.role, "content": msg.content})
 
+    # ── Call the LLM ───────────────────────────────────────────────────────
     try:
         result = await get_chat_response(messages)
     except Exception as e:
-        # Save error as assistant message
-        error_content = "I'm having trouble connecting right now. Please try again in a moment, or reach out to Harsh directly at harshme08@gmail.com!"
+        print(f"[ERROR] LLM call failed: {e}")
+        error_content = (
+            "I'm having trouble connecting right now. Please try again in a moment, "
+            "or reach out to Harsh directly at harshme08@gmail.com! 😊"
+        )
         error_msg = ChatMessage(
             session_id=request.session_id,
             role="assistant",
@@ -130,19 +193,31 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
             session_id=request.session_id,
         )
 
-    # Save assistant response to DB
+    # ── LAYER 2: Post-response validation ──────────────────────────────────
+    validation = validate_response(result["content"])
+
+    if not validation["is_safe"]:
+        print(f"[L2] BLOCKED — Issues: {validation['issues']}")
+        final_reply = validation["sanitized_response"]
+        model_label = f"{result['model_used']}|sanitized"
+    else:
+        print(f"[L2] PASSED — Response is safe")
+        final_reply = result["content"]
+        model_label = result["model_used"]
+
+    # ── Save assistant response to DB ──────────────────────────────────────
     assistant_msg = ChatMessage(
         session_id=request.session_id,
         role="assistant",
-        content=result["content"],
-        model_used=result["model_used"],
+        content=final_reply,
+        model_used=model_label,
     )
     db.add(assistant_msg)
     db.commit()
 
     return ChatResponse(
-        reply=result["content"],
-        model_used=result["model_used"],
+        reply=final_reply,
+        model_used=model_label,
         session_id=request.session_id,
     )
 
